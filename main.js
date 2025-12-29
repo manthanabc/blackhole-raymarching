@@ -31,9 +31,8 @@ const composer = new EffectComposer(renderer);
 composer.addPass(renderScene);
 composer.addPass(bloomPass);
 
-// --- Raymarched Black Hole ---
-// We render the black hole on a box that encloses the volume.
-// The fragment shader handles the gravitational lensing ray-tracing.
+// --- Raymarched Black Hole & Stars ---
+// We render everything in a single shader for correct warping and performance.
 
 const bhVertexShader = `
   varying vec2 vUv;
@@ -44,28 +43,33 @@ const bhVertexShader = `
     vUv = uv;
     vec4 worldPosition = modelMatrix * vec4(position, 1.0);
     vWorldPosition = worldPosition.xyz;
-    vViewPosition = cameraPosition; // Built-in uniform in some setups, but we pass it explicitly if needed
     gl_Position = projectionMatrix * viewMatrix * worldPosition;
   }
 `;
 
 const bhFragmentShader = `
   uniform float uTime;
-  uniform vec2 uResolution;
   uniform vec3 uCameraPos;
   uniform vec3 uColorInner;
   uniform vec3 uColorOuter;
 
   varying vec3 vWorldPosition;
 
-  // Constants
-  #define MAX_STEPS 100
-  #define STEP_SIZE 0.2
+  // Performance Settings
+  #define MAX_STEPS 60      // Reduced from 100
+  #define STEP_SIZE 0.3     // Increased step size
   #define BH_RADIUS 2.0
   #define DISK_INNER 3.5
   #define DISK_OUTER 7.5
   
-  // Noise functions for the disk texture
+  // Fast Hash for stars
+  float hash(vec3 p) {
+    p  = fract( p*0.3183099+.1 );
+    p *= 17.0;
+    return fract( p.x*p.y*p.z*(p.x+p.y+p.z) );
+  }
+
+  // Simplex noise for disk (Optimized)
   vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
   vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
   vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
@@ -93,46 +97,65 @@ const bhFragmentShader = `
     return 130.0 * dot(m, g);
   }
 
-  // Texture generation for the accretion disk
   vec4 getDiskColor(vec3 pos) {
     float r = length(pos);
     if (r < DISK_INNER || r > DISK_OUTER) return vec4(0.0);
     
-    // Normalize radius
     float rNorm = (r - DISK_INNER) / (DISK_OUTER - DISK_INNER);
-    float angle = atan(pos.z, pos.x); // Disk in XZ plane
+    float angle = atan(pos.z, pos.x);
     
     // Animation
-    float speed = 2.0 / (rNorm + 0.1);
+    float speed = 1.5 / (rNorm + 0.1);
     float rotAngle = angle + uTime * speed;
     
-    // Noise layers
-    float n1 = snoise(vec2(r * 2.0, rotAngle * 4.0));
-    float n2 = snoise(vec2(r * 4.0 - uTime, rotAngle * 8.0));
+    // Single layer of noise for performance, but warped coordinates
+    float n1 = snoise(vec2(r * 1.5, rotAngle * 3.0));
     
-    float intensity = 0.5 * n1 + 0.5 * n2;
-    intensity = 0.5 + 0.5 * intensity;
-    intensity = pow(intensity, 3.0); // Contrast
+    float intensity = 0.5 + 0.5 * n1;
+    intensity = pow(intensity, 3.0);
     
-    // Color
     vec3 col = mix(uColorOuter, uColorInner, intensity + (1.0 - rNorm) * 0.5);
     
-    // Inner rim glow
+    // Inner rim
     float rim = smoothstep(0.1, 0.0, rNorm);
-    col += vec3(1.0) * rim * 5.0;
+    col += vec3(1.0) * rim * 3.0;
     
-    // Soft edges
     float alpha = smoothstep(0.0, 0.1, rNorm) * smoothstep(1.0, 0.5, rNorm);
     
-    // Doppler (fake): brighter on left (negative x)
+    // Doppler
     float doppler = 1.0 - 0.5 * (pos.x / DISK_OUTER);
     col *= doppler;
     
-    return vec4(col * 4.0, alpha); // Boost brightness significantly to compensate for lower bloom
+    return vec4(col * 4.0, alpha);
+  }
+
+  vec3 getStarfield(vec3 dir) {
+    // Procedural stars based on direction
+    // We use the bent direction 'dir' so stars warp automatically
+    
+    // Grid based approach for stability
+    vec3 p = dir * 150.0; // Scale determines density
+    float h = hash(floor(p));
+    
+    // Jitter
+    vec3 f = fract(p);
+    
+    // Simple point stars
+    // If hash > threshold, draw star
+    float star = 0.0;
+    if(h > 0.98) {
+        float brightness = (h - 0.98) / 0.02; // Normalize 0-1
+        // Circular shape
+        // We need to check distance to random point in cell? 
+        // Simpler: just threshold noise
+        star = brightness;
+    }
+    
+    // Add some variation
+    return vec3(star);
   }
 
   void main() {
-    // Ray setup
     vec3 ro = uCameraPos;
     vec3 rd = normalize(vWorldPosition - ro);
     
@@ -142,54 +165,49 @@ const bhFragmentShader = `
     vec4 finalColor = vec4(0.0);
     bool hitHorizon = false;
     
-    // Raymarching loop
+    // Raymarching
     for(int i = 0; i < MAX_STEPS; i++) {
       float distToCenter = length(curPos);
       
-      // Event Horizon Hit
       if(distToCenter < BH_RADIUS) {
         hitHorizon = true;
-        finalColor.rgb = vec3(0.0); // Black hole
+        finalColor.rgb = vec3(0.0);
         finalColor.a = 1.0;
         break;
       }
       
-      // Gravity Bending (Simplified Newtonian-ish)
-      // Bend the ray direction towards the center
-      // Force ~ 1/r^2
-      float bendStrength = 0.5; // Tweak this for "warpiness"
+      // Gravity (1/r^2)
+      // Optimized bending
+      float bend = 0.8 / (distToCenter * distToCenter + 0.01);
       vec3 toCenter = normalize(-curPos);
-      curDir += toCenter * (bendStrength / (distToCenter * distToCenter)) * STEP_SIZE;
+      curDir += toCenter * bend * STEP_SIZE;
       curDir = normalize(curDir);
       
-      // Move ray
       vec3 nextPos = curPos + curDir * STEP_SIZE;
       
-      // Check Disk Intersection (Plane Y=0)
-      // We check if we crossed the Y=0 plane in this step
+      // Disk Intersection
       if(curPos.y * nextPos.y < 0.0) {
-        // Exact intersection point
         float t = curPos.y / (curPos.y - nextPos.y);
         vec3 hitPos = mix(curPos, nextPos, t);
-        
         vec4 diskCol = getDiskColor(hitPos);
         
-        // Accumulate color (additive blending for glowing plasma)
-        // Simple alpha blending
         finalColor.rgb += diskCol.rgb * diskCol.a * (1.0 - finalColor.a);
         finalColor.a += diskCol.a;
-        
-        if(finalColor.a >= 0.95) break; // Opaque enough
+        if(finalColor.a >= 0.95) break;
       }
       
       curPos = nextPos;
       
-      // Optimization: If we are far away and moving away, stop
-      if(distToCenter > 30.0 && dot(curDir, curPos) > 0.0) break;
+      // Early exit
+      if(distToCenter > 40.0) break;
     }
     
-    // If we didn't hit anything opaque, we are transparent (show stars)
-    // But we might have accumulated some disk glow
+    // Background Stars (Warped!)
+    if (finalColor.a < 1.0) {
+        // Use the final bent direction 'curDir' to sample stars
+        vec3 stars = getStarfield(curDir);
+        finalColor.rgb += stars * (1.0 - finalColor.a);
+    }
     
     gl_FragColor = finalColor;
   }
@@ -205,77 +223,14 @@ const bhMaterial = new THREE.ShaderMaterial({
   vertexShader: bhVertexShader,
   fragmentShader: bhFragmentShader,
   side: THREE.BackSide, // Render on the inside of the box so we can fly in
-  transparent: true,
+  transparent: false, // We render stars, so it's opaque
   blending: THREE.NormalBlending // We handle blending manually in shader mostly
 });
 
 // Large box to contain the effect
-const bhGeometry = new THREE.BoxGeometry(40, 40, 40);
+const bhGeometry = new THREE.BoxGeometry(100, 100, 100); // Larger box for sky
 const blackHoleMesh = new THREE.Mesh(bhGeometry, bhMaterial);
 scene.add(blackHoleMesh);
-
-
-// --- Space Warping (Starfield) ---
-// We keep the stars as actual geometry for the background depth
-// The shader above is transparent where there is no black hole, so stars show through.
-// Note: The shader doesn't warp the stars (that would require passing stars as a texture).
-// But we can warp the stars in their own vertex shader like before.
-
-const starVertexShader = `
-  uniform float uTime;
-  attribute float size;
-  varying vec3 vColor;
-  void main() {
-    vColor = vec3(0.9, 0.95, 1.0);
-    vec3 pos = position;
-    
-    // Simple radial warp to match the black hole gravity
-    float dist = length(pos);
-    float warpFactor = 400.0 / (dist * dist + 0.1);
-    pos += normalize(pos) * warpFactor;
-
-    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
-    gl_PointSize = size * (300.0 / -mvPosition.z);
-    gl_Position = projectionMatrix * mvPosition;
-  }
-`;
-
-const starFragmentShader = `
-  varying vec3 vColor;
-  void main() {
-    vec2 uv = gl_PointCoord.xy - 0.5;
-    if (length(uv) > 0.5) discard;
-    gl_FragColor = vec4(vColor, 1.0);
-  }
-`;
-
-const starGeometry = new THREE.BufferGeometry();
-const starCount = 5000;
-const posArray = new Float32Array(starCount * 3);
-const sizeArray = new Float32Array(starCount);
-
-for (let i = 0; i < starCount; i++) {
-  const r = 60 + Math.random() * 200;
-  const theta = Math.random() * Math.PI * 2;
-  const phi = Math.acos(2 * Math.random() - 1);
-  posArray[i * 3] = r * Math.sin(phi) * Math.cos(theta);
-  posArray[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
-  posArray[i * 3 + 2] = r * Math.cos(phi);
-  sizeArray[i] = Math.random() * 2.0;
-}
-
-starGeometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
-starGeometry.setAttribute('size', new THREE.BufferAttribute(sizeArray, 1));
-
-const starMaterial = new THREE.ShaderMaterial({
-  uniforms: { uTime: { value: 0 } },
-  vertexShader: starVertexShader,
-  fragmentShader: starFragmentShader,
-  transparent: true
-});
-
-const stars = new THREE.Points(starGeometry, starMaterial);
-scene.add(stars);
 
 
 // --- Animation & Scroll ---
