@@ -5,42 +5,37 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 
 // Scene Setup
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 50000);
 const renderer = new THREE.WebGLRenderer({
   canvas: document.querySelector('#bg'),
   antialias: false,
-  powerPreference: "high-performance",
-  alpha: true
+  powerPreference: "high-performance"
 });
 
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.5;
-camera.position.set(0, 5, 30); // Start slightly above to see the "elongated" shape
+renderer.toneMappingExposure = 1.2;
+// Start with a good viewing angle - slightly above and to the side
+camera.position.set(5, 8, 25);
 
 // --- Post Processing (Bloom) ---
 const renderScene = new RenderPass(scene, camera);
 
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
-bloomPass.threshold = 0.2; // Higher threshold
-bloomPass.strength = 0.4; // Low strength
-bloomPass.radius = 0.2;
+bloomPass.threshold = 0.5;
+bloomPass.strength = 0.15;
+bloomPass.radius = 0.1;
 
 const composer = new EffectComposer(renderer);
 composer.addPass(renderScene);
 composer.addPass(bloomPass);
 
-// --- Raymarched Black Hole & Stars ---
-// We render everything in a single shader for correct warping and performance.
-
+// --- Raymarched Black Hole with Interstellar-style Banding ---
 const bhVertexShader = `
-  varying vec2 vUv;
-  varying vec3 vViewPosition;
   varying vec3 vWorldPosition;
   
   void main() {
-    vUv = uv;
     vec4 worldPosition = modelMatrix * vec4(position, 1.0);
     vWorldPosition = worldPosition.xyz;
     gl_Position = projectionMatrix * viewMatrix * worldPosition;
@@ -50,109 +45,89 @@ const bhVertexShader = `
 const bhFragmentShader = `
   uniform float uTime;
   uniform vec3 uCameraPos;
-  uniform vec3 uColorInner;
-  uniform vec3 uColorOuter;
+  uniform float uScrollFade; // 0 = full visibility, 1 = faded out
 
   varying vec3 vWorldPosition;
 
-  // Performance Settings
-  #define MAX_STEPS 60      // Reduced from 100
-  #define STEP_SIZE 0.3     // Increased step size
-  #define BH_RADIUS 2.0
-  #define DISK_INNER 3.5
-  #define DISK_OUTER 7.5
+  // Settings
+  #define MAX_STEPS 80
+  #define BH_RADIUS 2.5
+  #define DISK_INNER 2.8
+  #define DISK_OUTER 18.0
+  #define BEND_STRENGTH 1.2
   
-  // Fast Hash for stars
+  // Hash for stars
   float hash(vec3 p) {
-    p  = fract( p*0.3183099+.1 );
+    p = fract(p * 0.3183099 + 0.1);
     p *= 17.0;
-    return fract( p.x*p.y*p.z*(p.x+p.y+p.z) );
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
   }
 
-  // Simplex noise for disk (Optimized)
-  vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
-  vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
-  vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
-  float snoise(vec2 v) {
-    const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
-    vec2 i  = floor(v + dot(v, C.yy) );
-    vec2 x0 = v - i + dot(i, C.xx);
-    vec2 i1;
-    i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
-    vec4 x12 = x0.xyxy + C.xxzz;
-    x12.xy -= i1;
-    i = mod289(i);
-    vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0 )) + i.x + vec3(0.0, i1.x, 1.0 ));
-    vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
-    m = m*m ;
-    m = m*m ;
-    vec3 x = 2.0 * fract(p * C.www) - 1.0;
-    vec3 h = abs(x) - 0.5;
-    vec3 ox = floor(x + 0.5);
-    vec3 a0 = x - ox;
-    m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
-    vec3 g;
-    g.x  = a0.x  * x0.x  + h.x  * x0.y;
-    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
-    return 130.0 * dot(m, g);
-  }
-
+  // Disk color - large, chaotic, slow, powerful bands
   vec4 getDiskColor(vec3 pos) {
-    float r = length(pos);
+    float r = length(pos.xz);
     if (r < DISK_INNER || r > DISK_OUTER) return vec4(0.0);
     
     float rNorm = (r - DISK_INNER) / (DISK_OUTER - DISK_INNER);
     float angle = atan(pos.z, pos.x);
     
-    // Animation
-    float speed = 1.5 / (rNorm + 0.1);
+    // Very slow, powerful rotation
+    float speed = 0.3 / (rNorm + 0.5);
     float rotAngle = angle + uTime * speed;
     
-    // Single layer of noise for performance, but warped coordinates
-    float n1 = snoise(vec2(r * 1.5, rotAngle * 3.0));
+    // Large, organic bands - only 3-4 major bands
+    float bandFreq = 3.5;
+    float band = sin(rNorm * bandFreq * 3.14159) * 0.5 + 0.5;
     
-    float intensity = 0.5 + 0.5 * n1;
-    intensity = pow(intensity, 3.0);
+    // Add chaotic variation using noise-like patterns
+    float chaos1 = sin(rotAngle * 2.0 + r * 0.5) * 0.3;
+    float chaos2 = sin(rotAngle * 5.0 - r * 1.5 + uTime * 0.1) * 0.15;
+    float chaos3 = sin(angle * 3.0 + rNorm * 8.0) * 0.2;
     
-    vec3 col = mix(uColorOuter, uColorInner, intensity + (1.0 - rNorm) * 0.5);
+    float intensity = band + chaos1 + chaos2 + chaos3;
+    intensity = clamp(intensity, 0.0, 1.0);
+    intensity = pow(intensity, 1.5); // Soft contrast
     
-    // Inner rim
-    float rim = smoothstep(0.1, 0.0, rNorm);
-    col += vec3(1.0) * rim * 3.0;
+    // Color gradient: bright cream inner -> warm orange -> dark outer  
+    vec3 colorInner = vec3(1.0, 0.95, 0.85);
+    vec3 colorMid = vec3(0.85, 0.55, 0.25);
+    vec3 colorOuter = vec3(0.25, 0.12, 0.05);
     
-    float alpha = smoothstep(0.0, 0.1, rNorm) * smoothstep(1.0, 0.5, rNorm);
+    vec3 col;
+    if (rNorm < 0.35) {
+      col = mix(colorInner, colorMid, rNorm / 0.35);
+    } else {
+      col = mix(colorMid, colorOuter, (rNorm - 0.35) / 0.65);
+    }
     
-    // Doppler
-    float doppler = 1.0 - 0.5 * (pos.x / DISK_OUTER);
+    // Apply intensity variation
+    col *= 0.4 + intensity * 0.6;
+    
+    // Bright inner rim
+    float rim = smoothstep(0.12, 0.0, rNorm);
+    col += vec3(1.0, 0.95, 0.9) * rim * 3.0;
+    
+    // Soft edges
+    float alpha = smoothstep(0.0, 0.08, rNorm) * smoothstep(1.0, 0.8, rNorm);
+    
+    // Doppler beaming
+    float doppler = 0.5 + 0.8 * clamp((pos.x / DISK_OUTER + 0.5), 0.0, 1.0);
     col *= doppler;
     
-    return vec4(col * 4.0, alpha);
+    return vec4(col * 2.0, alpha * 0.9);
   }
 
   vec3 getStarfield(vec3 dir) {
-    // Procedural stars based on direction
-    // We use the bent direction 'dir' so stars warp automatically
-    
-    // Grid based approach for stability
-    vec3 p = dir * 150.0; // Scale determines density
+    vec3 p = dir * 200.0;
     float h = hash(floor(p));
     
-    // Jitter
-    vec3 f = fract(p);
-    
-    // Simple point stars
-    // If hash > threshold, draw star
     float star = 0.0;
-    if(h > 0.98) {
-        float brightness = (h - 0.98) / 0.02; // Normalize 0-1
-        // Circular shape
-        // We need to check distance to random point in cell? 
-        // Simpler: just threshold noise
-        star = brightness;
+    if(h > 0.985) {
+      star = (h - 0.985) / 0.015;
+      star = pow(star, 2.0); // Make brighter stars brighter
     }
     
-    // Add some variation
-    return vec3(star);
+    return vec3(star * 0.8);
   }
 
   void main() {
@@ -163,51 +138,64 @@ const bhFragmentShader = `
     vec3 curDir = rd;
     
     vec4 finalColor = vec4(0.0);
-    bool hitHorizon = false;
+    vec3 lastDir = rd;
     
-    // Raymarching
+    // Raymarching with adaptive step size
     for(int i = 0; i < MAX_STEPS; i++) {
       float distToCenter = length(curPos);
       
-      if(distToCenter < BH_RADIUS) {
-        hitHorizon = true;
-        finalColor.rgb = vec3(0.0);
-        finalColor.a = 1.0;
-        break;
-      }
+      // Adaptive step size - smaller near the hole for precision
+      float stepSize = max(0.2, min(distToCenter * 0.08, 2.0));
       
-      // Gravity (1/r^2)
-      // Optimized bending
-      float bend = 0.8 / (distToCenter * distToCenter + 0.01);
+      // Gravitational bending - reduced for subtlety
+      float bend = 0.5 / (distToCenter * distToCenter + 0.01);
       vec3 toCenter = normalize(-curPos);
-      curDir += toCenter * bend * STEP_SIZE;
+      curDir += toCenter * bend * stepSize;
       curDir = normalize(curDir);
+      lastDir = curDir;
       
-      vec3 nextPos = curPos + curDir * STEP_SIZE;
+      vec3 nextPos = curPos + curDir * stepSize;
+      float nextDist = length(nextPos);
       
-      // Disk Intersection
+      // Check disk intersection FIRST (before horizon check)
+      // This ensures rays that cross the disk on their way to the hole still render
       if(curPos.y * nextPos.y < 0.0) {
-        float t = curPos.y / (curPos.y - nextPos.y);
+        float t = abs(curPos.y) / (abs(curPos.y) + abs(nextPos.y));
         vec3 hitPos = mix(curPos, nextPos, t);
+        
         vec4 diskCol = getDiskColor(hitPos);
         
+        // Alpha blend
         finalColor.rgb += diskCol.rgb * diskCol.a * (1.0 - finalColor.a);
-        finalColor.a += diskCol.a;
-        if(finalColor.a >= 0.95) break;
+        finalColor.a += diskCol.a * (1.0 - finalColor.a);
+        
+        if(finalColor.a >= 0.98) break;
+      }
+      
+      // Event Horizon check - ray fell into the black hole
+      if(nextDist < BH_RADIUS) {
+        // If we haven't accumulated enough disk color, fill with black
+        if(finalColor.a < 0.5) {
+          finalColor.rgb = vec3(0.0);
+          finalColor.a = 1.0;
+        }
+        break;
       }
       
       curPos = nextPos;
       
-      // Early exit
-      if(distToCenter > 40.0) break;
+      // Early exit if far away
+      if(distToCenter > 80.0) break;
     }
     
-    // Background Stars (Warped!)
+    // Background stars
     if (finalColor.a < 1.0) {
-        // Use the final bent direction 'curDir' to sample stars
-        vec3 stars = getStarfield(curDir);
-        finalColor.rgb += stars * (1.0 - finalColor.a);
+      vec3 stars = getStarfield(lastDir);
+      finalColor.rgb += stars * (1.0 - finalColor.a);
     }
+    
+    // Apply scroll fade (fade to black as we scroll)
+    finalColor.rgb *= (1.0 - uScrollFade);
     
     gl_FragColor = finalColor;
   }
@@ -217,27 +205,21 @@ const bhMaterial = new THREE.ShaderMaterial({
   uniforms: {
     uTime: { value: 0 },
     uCameraPos: { value: camera.position },
-    uColorInner: { value: new THREE.Color(0xaaddff) }, // Cyan
-    uColorOuter: { value: new THREE.Color(0x001133) }, // Dark Blue
+    uScrollFade: { value: 0 }
   },
   vertexShader: bhVertexShader,
   fragmentShader: bhFragmentShader,
-  side: THREE.BackSide, // Render on the inside of the box so we can fly in
-  transparent: false, // We render stars, so it's opaque
-  blending: THREE.NormalBlending // We handle blending manually in shader mostly
+  side: THREE.BackSide,
+  transparent: false
 });
 
-// Large box to contain the effect
-const bhGeometry = new THREE.BoxGeometry(100, 100, 100); // Larger box for sky
+const bhGeometry = new THREE.BoxGeometry(500, 500, 500);
 const blackHoleMesh = new THREE.Mesh(bhGeometry, bhMaterial);
 scene.add(blackHoleMesh);
-
 
 // --- Animation & Scroll ---
 let mouseX = 0;
 let mouseY = 0;
-let targetX = 0;
-let targetY = 0;
 
 const windowHalfX = window.innerWidth / 2;
 const windowHalfY = window.innerHeight / 2;
@@ -267,40 +249,49 @@ const clock = new THREE.Clock();
 function animate() {
   const elapsedTime = clock.getElapsedTime();
 
-  // Update uniforms
   bhMaterial.uniforms.uTime.value = elapsedTime;
   bhMaterial.uniforms.uCameraPos.value.copy(camera.position);
 
-  targetX = mouseX * 0.001;
-  targetY = mouseY * 0.001;
-
   const scrollY = window.scrollY;
   const maxScroll = document.body.scrollHeight - window.innerHeight;
-  const scrollPercent = scrollY / maxScroll;
+  const scrollPercent = Math.min(scrollY / maxScroll, 1.0);
 
-  // Camera Path
-  // Start high and far to see the "elongated" disk shape
-  const p1 = { x: 0, y: 6, z: 35 };
-  const p2 = { x: 8, y: 3, z: 18 };
-  const p3 = { x: -6, y: -2, z: 10 };
-  const p4 = { x: 0, y: 0, z: 5 };
+  // Camera Path: Start viewing the black hole, then pull away into empty space
+  // p1: Good viewing angle to see the elongated disk
+  // p2: Move around
+  // p3: Pull far back into space
+  // p4: Very far, mostly black sky
+
+  const p1 = { x: 5, y: 12, z: 30 };    // Above and to the side - see the full disk
+  const p2 = { x: 15, y: 5, z: 25 };    // Orbit around
+  const p3 = { x: 0, y: 2, z: 60 };     // Pull back
+  const p4 = { x: 0, y: 0, z: 120 };    // Further into space
 
   let targetPos = new THREE.Vector3();
+  let scrollFade = 0;
 
-  if (scrollPercent < 0.33) {
-    const t = scrollPercent / 0.33;
+  if (scrollPercent < 0.3) {
+    const t = scrollPercent / 0.3;
     targetPos.lerpVectors(new THREE.Vector3(p1.x, p1.y, p1.z), new THREE.Vector3(p2.x, p2.y, p2.z), t);
-  } else if (scrollPercent < 0.66) {
-    const t = (scrollPercent - 0.33) / 0.33;
+  } else if (scrollPercent < 0.6) {
+    const t = (scrollPercent - 0.3) / 0.3;
     targetPos.lerpVectors(new THREE.Vector3(p2.x, p2.y, p2.z), new THREE.Vector3(p3.x, p3.y, p3.z), t);
   } else {
-    const t = (scrollPercent - 0.66) / 0.34;
+    const t = (scrollPercent - 0.6) / 0.4;
     targetPos.lerpVectors(new THREE.Vector3(p3.x, p3.y, p3.z), new THREE.Vector3(p4.x, p4.y, p4.z), t);
+    // Start fading to black in the last phase
+    scrollFade = t * 0.8; // Max 80% fade
   }
 
-  camera.position.x += (targetPos.x - camera.position.x) * 0.05 + (targetX - camera.rotation.y) * 0.5;
-  camera.position.y += (targetPos.y - camera.position.y) * 0.05 + (targetY - camera.rotation.x) * 0.5;
-  camera.position.z += (targetPos.z - camera.position.z) * 0.05;
+  bhMaterial.uniforms.uScrollFade.value = scrollFade;
+
+  // Smooth camera movement
+  const mouseDampX = mouseX * 0.0005;
+  const mouseDampY = mouseY * 0.0005;
+
+  camera.position.x += (targetPos.x - camera.position.x) * 0.03 + mouseDampX;
+  camera.position.y += (targetPos.y - camera.position.y) * 0.03 + mouseDampY;
+  camera.position.z += (targetPos.z - camera.position.z) * 0.03;
 
   camera.lookAt(0, 0, 0);
 
