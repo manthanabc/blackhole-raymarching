@@ -25,7 +25,7 @@ const renderScene = new RenderPass(scene, camera);
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
 bloomPass.threshold = 0.5;
 bloomPass.strength = 0.15;
-bloomPass.radius = 0.1;
+bloomPass.radius = 0.2;
 
 const composer = new EffectComposer(renderer);
 composer.addPass(renderScene);
@@ -53,7 +53,7 @@ const bhFragmentShader = `
   #define MAX_STEPS 80
   #define BH_RADIUS 2.5
   #define DISK_INNER 2.8
-  #define DISK_OUTER 18.0
+  #define DISK_OUTER 12.0
   #define BEND_STRENGTH 1.2
   
   // Hash for stars
@@ -88,10 +88,10 @@ const bhFragmentShader = `
     intensity = clamp(intensity, 0.0, 1.0);
     intensity = pow(intensity, 1.5); // Soft contrast
     
-    // Color gradient: bright cream inner -> warm orange -> dark outer  
-    vec3 colorInner = vec3(1.0, 0.95, 0.85);
-    vec3 colorMid = vec3(0.85, 0.55, 0.25);
-    vec3 colorOuter = vec3(0.25, 0.12, 0.05);
+    // Color gradient: bright warm inner -> red -> dark red outer  
+    vec3 colorInner = vec3(1.0, 0.85, 0.7);    // Warm cream/peach
+    vec3 colorMid = vec3(0.9, 0.35, 0.15);     // Bright red-orange
+    vec3 colorOuter = vec3(0.35, 0.08, 0.02);  // Dark crimson
     
     vec3 col;
     if (rNorm < 0.35) {
